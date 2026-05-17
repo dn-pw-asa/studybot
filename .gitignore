@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.studybot/
+studybot.egg-info/
+test_*.txt
+1.0
+dist/
+build/
