@@ -134,7 +134,6 @@ class PracticeManager:
                 if result:
                     return result
         # Markdown: ## header as question, following text as answer
-        lines = content.split("\n")
         if any(l.strip().startswith("##") for l in lines):
             # Skip fenced code blocks
             clean = []; in_code = False
@@ -156,7 +155,6 @@ class PracticeManager:
             if len(qs) >= 2:
                 return qs
         # Bullet list: each line starting with - * or number is a question
-        lines = content.split("\n")
         questions = []
         for line in lines:
             stripped = line.strip()
@@ -659,6 +657,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Hira
 .topbar{padding:0 12px;height:48px}}
 .hljs{background:transparent!important;padding:12px 16px!important}
 pre code.hljs{padding:0!important}
+.chip-group{display:flex;flex-wrap:wrap;gap:6px}
+.plan-input{width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg);color:var(--fg);font-size:14px;font-family:inherit;box-sizing:border-box}
+.plan-input:focus{outline:none;border-color:var(--primary)}
+.rv-card-front,.rv-card-back{position:absolute;inset:0;-webkit-backface-visibility:hidden;backface-visibility:hidden;display:flex;flex-direction:column;justify-content:center;align-items:center;padding:20px;border-radius:var(--radius-lg);box-shadow:var(--shadow-md);font-size:18px;line-height:1.6}
+.rv-card-front{background:var(--bg)}
+.rv-card-back{background:var(--primary-light);transform:rotateY(180deg)}
+button.primary{color:var(--primary);border-color:var(--primary);background:transparent;border:1px solid;padding:6px 14px;border-radius:var(--radius-sm);cursor:pointer;font-family:inherit;transition:all .12s}
+button.primary:hover{background:var(--primary-light)}
 </style>
 </head>
 <body>
@@ -991,7 +997,7 @@ pre code.hljs{padding:0!important}
 const WS_URL = 'ws://HOST:PORT';
 const markedOptions = {breaks:true,gfm:true};
 let ws=null,streamContent='',streamMsgEl=null,isStreaming=false,fileList=[];
-let chatHistory=[];
+
 
 const $=id=>document.getElementById(id);
 const chat=$('chat'),chatInner=$('chatInner'),input=$('input'),sendBtn=$('sendBtn');
@@ -1051,10 +1057,39 @@ document.querySelectorAll('.nav-item').forEach(item=>{
     if(window.innerWidth<900)toggleSidebar(false)
     if(view==='banks')fetchBanks();
     if(view==='progress')fetchStats();
+    if(view==='settings')loadSettings();
+    if(view==='review')loadReviewCards();
     if(view==='plan')fetchPlans();
+    if(view==='practice'){
+      if(window._activePlan&&window._activePlan.id){
+        $('pvModeSelector').style.display='none';
+        $('pvContent').style.display='';
+        const plan=planData.plans.find(p=>p.id===window._activePlan.id);
+        $('pvTitle').textContent='📋 '+(plan?plan.name:'计划');
+        $('pvBankControls').style.display='none';
+        $('pvPlanControls').style.display='';
+        refreshPlanIndicator()
+      }else if(pvMode==='bank'){
+        $('pvModeSelector').style.display='none';
+        $('pvContent').style.display='';
+        $('pvTitle').textContent='按题库做题';
+        $('pvBankControls').style.display='';
+        $('pvPlanControls').style.display='none'
+      }else if(pvMode==='plan'){
+        $('pvModeSelector').style.display='none';
+        $('pvContent').style.display='';
+        $('pvTitle').textContent='按计划做题';
+        $('pvBankControls').style.display='none';
+        $('pvPlanControls').style.display='';
+        renderPvPlanList()
+      }else{
+        $('pvModeSelector').style.display='';
+        $('pvContent').style.display='none';
+        delete window._activePlan;
+      }
+    }
   }
 });
-
 function toggleSidebar(open){
   if(open)sidebar.classList.remove('collapsed')
   else if(open===false)sidebar.classList.add('collapsed')
@@ -1063,115 +1098,11 @@ function toggleSidebar(open){
 }
 menuBtn.onclick=()=>{toggleSidebar()};
 sidebarOverlay.onclick=()=>{toggleSidebar(false)};
-
-/* Auto-expand sidebar when resizing from mobile to desktop */
-let prevWidth=window.innerWidth;
 window.addEventListener('resize',()=>{
-  const w=window.innerWidth;
+  const w=window.innerWidth,prevWidth=window._lastWidth||w;
   if(prevWidth<900&&w>=900)sidebar.classList.remove('collapsed');
-  prevWidth=w
+  window._lastWidth=w
 });
-
-/* Toast */
-function showToast(msg){toast.textContent=msg;toast.style.display='block';setTimeout(()=>{toast.style.display='none'},2500)}
-
-/* Connection status */
-function setStatus(state,label){const cls={connected:'online',connecting:'connecting',disconnected:'offline'}[state]||'offline';siderDot.className='dot '+cls;siderLabel.textContent=label}
-
-/* Chat helpers */
-function autoResize(el){el.style.height='auto';el.style.height=Math.min(el.scrollHeight,200)+'px'}
-function escapeHtml(t){const d=document.createElement('div');d.appendChild(document.createTextNode(t));return d.innerHTML}
-function scrollBottom(){chat.scrollTop=chat.scrollHeight}
-function renderMd(text){if(typeof marked!=='undefined'&&marked.parse){try{return marked.parse(text,markedOptions)}catch(e){return escapeHtml(text)}}return escapeHtml(text).replace(/\n/g,'<br>')}
-function cleanCode(){if(typeof hljs!=='undefined'){document.querySelectorAll('pre code:not(.hljs)').forEach(b=>{try{hljs.highlightElement(b)}catch(e){}})}}
-
-function addMsg(content,role,isStream){
-  const es=chatInner.querySelector('.empty-state');
-  if(es)es.remove();
-  const div=document.createElement('div');
-  div.className='msg '+role;
-  if(isStream){div.dataset.streaming='true'}else{
-    div.innerHTML=role==='user'?escapeHtml(content):renderMd(content);
-    if(role==='assistant')cleanCode();
-  }
-  chatInner.appendChild(div);scrollBottom();return div
-}
-function updateStream(content,el){if(!el)return;el.innerHTML=renderMd(content)+'<span class="stream-cursor"></span>';scrollBottom()}
-function finalizeStream(content,el){if(!el)return;delete el.dataset.streaming;el.innerHTML=renderMd(content);cleanCode();scrollBottom()}
-
-function addFileChip(files){
-  const old=chatInner.querySelector('.file-chip');if(old)old.remove();
-  if(!files.length)return;
-  const names=files.map(f=>f.name).join(', ');
-  const chip=document.createElement('div');chip.className='file-chip';
-  chip.innerHTML='📎 '+escapeHtml(names)+' <button class="remove-file">×</button>';
-  chatInner.appendChild(chip);
-  chip.querySelector('.remove-file').onclick=()=>{fileList=[];chip.remove()}
-}
-
-/* Send / Stop */
-sendBtn.onclick=send;
-input.onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}};
-input.oninput=function(){autoResize(this)};
-uploadBtn.onclick=()=>fileInput.click();
-fileInput.onchange=()=>{fileList=fileInput.files.length?Array.from(fileInput.files):[];addFileChip(fileList)};
-
-['dragenter','dragover','dragleave','drop'].forEach(evt=>document.addEventListener(evt,e=>e.preventDefault()));
-const dragOverlay=document.querySelector('.drag-overlay');
-document.addEventListener('dragenter',e=>{if(e.dataTransfer.types.includes('Files'))dragOverlay.classList.add('active')});
-dragOverlay.addEventListener('dragleave',()=>dragOverlay.classList.remove('active'));
-document.addEventListener('drop',e=>{dragOverlay.classList.remove('active');const f=e.dataTransfer.files;if(f.length){fileList=Array.from(f);addFileChip(fileList);input.focus()}});
-
-async function uploadFiles(files){
-  for(const f of files){
-    try{const text=await f.text();ws.send(JSON.stringify({content:'[上传文件: '+f.name+']\n'+text}))}catch(e){}
-  }
-  fileList=[];addFileChip([])
-}
-
-function send(){
-  const text=input.value.trim();
-  if(isStreaming){sendStop();return}
-  if(!text&&!fileList.length)return;
-  if(text)addMsg(text,'user');
-  if(fileList.length){fileList.forEach(f=>addMsg('[📎 '+f.name+']','user'));uploadFiles(fileList)}
-  input.value='';input.style.height='auto';scrollBottom();
-  if(ws&&ws.readyState===WebSocket.OPEN){ws.send(JSON.stringify({content:text||'(uploaded files)'}))}
-}
-
-function sendStop(){
-  if(ws)ws.send(JSON.stringify({content:'/stop'}));
-  if(streamMsgEl){finalizeStream(streamContent,streamMsgEl);streamMsgEl=null}
-  streamContent='';isStreaming=false;sendBtn.textContent='➤';sendBtn.classList.remove('streaming')
-}
-
-/* WebSocket */
-function connect(){
-  setStatus('connecting','连接中...');
-  ws=new WebSocket(WS_URL);
-  ws.onopen=()=>{setStatus('connected','已连接');input.disabled=false;input.focus()};
-  ws.onmessage=e=>{try{handleMsg(JSON.parse(e.data))}catch(_){}};
-  ws.onclose=()=>{
-    if(isStreaming){if(streamMsgEl)finalizeStream(streamContent,streamMsgEl);streamContent='';isStreaming=false;sendBtn.textContent='➤';sendBtn.classList.remove('streaming')}
-    setStatus('disconnected','已断开');input.disabled=true;setTimeout(connect,3000)
-  };
-  ws.onerror=()=>ws.close()
-}
-
-function handleMsg(data){
-  const event=data.event||'',content=data.content||'',done=data.done||false;
-  if(event==='stream'){
-    streamContent+=content;
-    if(!streamMsgEl)streamMsgEl=addMsg('','assistant',true);
-    updateStream(streamContent,streamMsgEl);
-    isStreaming=true;sendBtn.textContent='■';sendBtn.classList.add('streaming')
-  }else if(event==='message'){
-    if(streamMsgEl){
-      finalizeStream(streamContent,streamMsgEl);
-      streamMsgEl=null;streamContent='';isStreaming=false;sendBtn.textContent='➤';sendBtn.classList.remove('streaming')
-    }else{if(content)addMsg(content,'assistant')}
-  }
-}
 
 /* Settings */
 function loadSettings(){
@@ -1210,7 +1141,6 @@ function setPracticeMode(mode){
     $('pvBankControls').style.display='';
     $('pvPlanControls').style.display='none';
     delete window._activePlan;
-    window._activePlanBankFilter=null;
     refreshPracticeControls();
     refreshPlanIndicator()
   }else{
@@ -1224,8 +1154,7 @@ $('pvBackBtn')&&($('pvBackBtn').onclick=()=>{
   pvMode=null;
   $('pvModeSelector').style.display='';
   $('pvContent').style.display='none';
-  delete window._activePlan;
-  window._activePlanBankFilter=null
+  delete window._activePlan
 });
 function renderPvPlanList(){
   const el=$('pvPlanList');
@@ -1262,7 +1191,6 @@ function refreshPlanIndicator(){
 }
 $('pvPlanStopBtn')&&($('pvPlanStopBtn').onclick=function(){
   delete window._activePlan;
-  window._activePlanBankFilter=null;
   refreshPlanIndicator();
   $('pvTitle').textContent='按计划做题';
   pvMode='plan';
@@ -1282,7 +1210,7 @@ function chipClickHandler(e){
     group.querySelectorAll('.chip').forEach(c=>c.classList.toggle('active',c===chip))
   }else{
     chip.classList.toggle('active');
-    const hasSpecific=group.querySelectorAll('.chip:not([data-value=""])').length>0;
+    const hasSpecific=group.querySelectorAll('.chip:not([data-value=""]).active').length>0;
     const allChip=group.querySelector('.chip[data-value=""]');
     if(allChip)allChip.classList.toggle('active',!hasSpecific)
   }
@@ -1603,52 +1531,9 @@ async function startPlanPractice(planId){
   $('pvBankControls').style.display='none';
   $('pvPlanControls').style.display='';
   window._activePlan={id:planId,day,date:todayStr,completed:log.completed,total:plan.questions_per_day,currentIndex:0};
-  window._activePlanBankFilter=plan.bank_names.length?plan.bank_names:null;
   refreshPlanIndicator();
   if(log.completed<plan.questions_per_day)setTimeout(loadPracticeQuestion,100)
 }
-
-/* Load tab data on switch */
-document.querySelectorAll('.nav-item').forEach(item=>{
-  const orig=item.onclick;
-  item.onclick=function(){
-    if(typeof orig==='function')orig.call(this);
-    const view=this.dataset.view;
-    if(view==='settings')loadSettings();
-    if(view==='practice'){
-      if(window._activePlan&&window._activePlan.id){
-        // Restore plan practice state
-        $('pvModeSelector').style.display='none';
-        $('pvContent').style.display='';
-        const plan=planData.plans.find(p=>p.id===window._activePlan.id);
-        $('pvTitle').textContent='📋 '+(plan?plan.name:'计划');
-        $('pvBankControls').style.display='none';
-        $('pvPlanControls').style.display='';
-        refreshPlanIndicator()
-      }else if(pvMode==='bank'){
-        $('pvModeSelector').style.display='none';
-        $('pvContent').style.display='';
-        $('pvTitle').textContent='按题库做题';
-        $('pvBankControls').style.display='';
-        $('pvPlanControls').style.display='none'
-      }else if(pvMode==='plan'){
-        $('pvModeSelector').style.display='none';
-        $('pvContent').style.display='';
-        $('pvTitle').textContent='按计划做题';
-        $('pvBankControls').style.display='none';
-        $('pvPlanControls').style.display='';
-        renderPvPlanList()
-      }else{
-        $('pvModeSelector').style.display='';
-        $('pvContent').style.display='none';
-        delete window._activePlan;
-        window._activePlanBankFilter=null
-      }
-    }
-    if(view==='review')loadReviewCards()
-    if(view==='plan')fetchPlans()
-  }
-});
 
 async function fetchBanks(){
   try{
@@ -1988,7 +1873,6 @@ class WebUIChannel:
                         pm = ch._practice
                         if pm and fcontent:
                             try:
-                                import asyncio
                                 future = asyncio.run_coroutine_threadsafe(
                                     pm.analyze_content(fname, fcontent), ch._loop
                                 )
@@ -2117,7 +2001,6 @@ class WebUIChannel:
                     self._ok("application/json", json.dumps({"error": "No provider"}).encode("utf-8"))
                     return
                 try:
-                    import asyncio
                     future = asyncio.run_coroutine_threadsafe(
                         pm.generate_question(bank_names, difficulties), ch._loop
                     )
@@ -2135,7 +2018,6 @@ class WebUIChannel:
                     return
                 user_answer = data.get("answer", "")
                 try:
-                    import asyncio
                     future = asyncio.run_coroutine_threadsafe(
                         pm.evaluate_answer(
                             pm.current.get("question", ""),
