@@ -1,6 +1,8 @@
 """Simplified agent loop with streaming support."""
 from __future__ import annotations
 
+import json
+
 from studybot.agent.runner import AgentRunner, AgentRunSpec
 from studybot.agent.tools.registry import ToolRegistry
 from studybot.bus import InboundMessage, MessageBus, OutboundMessage
@@ -63,6 +65,23 @@ class PracticeAgentLoop:
             session.add_message("system", SYSTEM_PROMPT)
 
         session.add_message("user", msg.content)
+
+        # Async context compression: summarize old messages when history grows too large
+        if len(session.messages) > 55:
+            summary_text = await self._compress_history(session)
+            if summary_text:
+                # Keep original system prompt (not summary)
+                keep = []
+                for m in session.messages:
+                    if m.get("role") == "system" and "历史摘要" not in m.get("content", ""):
+                        keep.append(m)
+                        break
+                # Recent messages (exclude old summaries)
+                recent = [m for m in session.messages[-15:] if "历史摘要" not in m.get("content", "")]
+                session.messages = keep + [
+                    {"role": "system", "content": f"## 历史摘要\n{summary_text[:800]}", "timestamp": 0}
+                ] + recent[-10:]
+
         history = session.get_history(max_messages=50)
 
         spec = AgentRunSpec(
@@ -102,3 +121,25 @@ class PracticeAgentLoop:
             chat_id=msg.chat_id,
             content=full_response,
         )
+
+    async def _compress_history(self, session) -> str:
+        """Async compression: summarize old messages via LLM."""
+        recent_raw = "\n".join(
+            m.get("content", "")[:300] for m in session.messages[-30:-5]
+            if m.get("role") in ("user", "assistant")
+        )
+        if not recent_raw.strip():
+            return ""
+        prompt = (
+            f"将以下对话历史压缩为3-5句摘要, 涵盖: 讨论主题、用户水平、常见错误、进度.\n\n"
+            f"{recent_raw[:3000]}"
+        )
+        try:
+            resp = await self.provider.chat(
+                [{"role": "user", "content": prompt}],
+                model=self.provider.default_model,
+                temperature=0.2,
+            )
+            return (resp.content or "")[:1200]
+        except Exception:
+            return ""

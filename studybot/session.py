@@ -6,7 +6,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 @dataclass
@@ -33,6 +33,55 @@ class Session:
             for m in recent
             if m.get("role") in ("system", "user", "assistant")
         ]
+
+    def apply_compression(self, compressor: ContextCompressor, max_messages: int = 50) -> None:
+        """Replace old messages with compressed summary in-place."""
+        filtered = [
+            {"role": m["role"], "content": m["content"], "timestamp": m.get("timestamp", time.time())}
+            for m in self.messages
+            if m.get("role") in ("system", "user", "assistant")
+        ]
+        if len(filtered) <= max_messages:
+            return
+        older = filtered[:-10]
+        recent = filtered[-10:]
+        summary = compressor.compress(older)
+        self.messages = summary + recent
+
+
+class ContextCompressor:
+    """分层上下文压缩: 将旧消息批量压缩为摘要."""
+
+    def __init__(self, summarize_fn: Callable[[str, str], str] | None = None) -> None:
+        self.summary: str = ""
+        self.summarize_fn = summarize_fn
+
+    def compress(self, older: list[dict]) -> list[dict]:
+        if not older:
+            return []
+        self._update_summary(older)
+        return [{"role": "system", "content": f"## 历史摘要\n{self.summary[:800]}", "timestamp": 0}]
+
+    def _update_summary(self, older: list[dict]) -> None:
+        text = "\n".join(
+            m.get("content", "")[:300] for m in older[-15:]
+            if m.get("role") in ("user", "assistant")
+        )
+        if self.summarize_fn:
+            try:
+                self.summary = self.summarize_fn(self.summary, text[:3000])[:1200]
+                return
+            except Exception:
+                pass
+        self._fallback_summary(older)
+
+    def _fallback_summary(self, older: list[dict]) -> None:
+        lines = [self.summary] if self.summary else []
+        for m in older[-8:]:
+            c = m.get("content", "").strip()
+            if len(c) > 30:
+                lines.append(c[:150])
+        self.summary = "\n".join(lines[-4:])[:800]
 
 
 class SessionManager:

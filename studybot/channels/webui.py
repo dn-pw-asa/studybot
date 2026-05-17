@@ -4,357 +4,16 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from dataclasses import dataclass, asdict
-from datetime import date, datetime, timedelta
+from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
 
 from studybot.bus import InboundMessage, MessageBus, OutboundMessage
+from studybot.channels.practice import PracticeManager
+from studybot.channels.review import ReviewManager
+from studybot.channels.memory import MemoryManager
 
-
-import random
-
-
-_JSON_PROMPT = "Return valid JSON only, no markdown wrapping."
-
-
-class PracticeManager:
-    """Generates practice questions & evaluates answers via LLM."""
-
-    def __init__(self, provider: Any, banks: list[dict]) -> None:
-        self.provider = provider
-        self.banks = banks
-        self.current: dict | None = None
-        self.history: list[dict] = []
-
-    async def generate_question(self, bank_names: list[str] | None = None, difficulties: list[str] | None = None) -> dict:
-        bank_names = bank_names or []
-        difficulties = difficulties or []
-        all_questions: list[tuple[dict, str]] = []
-        for b in self.banks:
-            b_name = b.get("name", "")
-            b_questions = b.get("questions") or b.get("_questions", [])
-            if not b_questions:
-                continue
-            if bank_names and b_name not in bank_names:
-                continue
-            if difficulties:
-                for q in b_questions:
-                    qd = q.get("difficulty", "")
-                    if not qd or qd in difficulties:
-                        all_questions.append((q, b_name))
-            else:
-                for q in b_questions:
-                    all_questions.append((q, b_name))
-        if all_questions:
-            q, src_bank = random.choice(all_questions)
-            self.current = {
-                "question": q["question"],
-                "expected_answer": q.get("answer", q.get("expected_answer", "")),
-                "key_points": q.get("key_points", []),
-                "domain": "",
-                "difficulty": difficulties[0] if difficulties else "",
-                "bank_name": src_bank,
-            }
-            return self.current
-        diff_label = difficulties[0] if difficulties else "中等"
-        prompt = (
-            f"{_JSON_PROMPT}\n"
-            f"Generate ONE {diff_label} practice question. Format:\n"
-            '{"question":"...","expected_answer":"...","key_points":["...","..."]}'
-        )
-        resp = await self.provider.chat(
-            [{"role": "user", "content": prompt}],
-            model=self.provider.default_model,
-        )
-        data = self._parse_json(resp.content or "")
-        self.current = data
-        self.current["domain"] = ""
-        self.current["difficulty"] = diff_label
-        return self.current
-
-    async def evaluate_answer(self, question: str, expected_answer: str, user_answer: str) -> dict:
-        has_answer = bool(expected_answer and expected_answer.strip())
-        prompt = (
-            f"{_JSON_PROMPT}\n"
-            "Evaluate the user's answer. Return:\n"
-            '{"score":0-100,"correct":true/false,"feedback":"...","missing_points":["...","..."]}\n\n'
-            f"Question: {question}\n"
-        )
-        if has_answer:
-            prompt += f"Expected answer: {expected_answer}\n"
-        else:
-            prompt += "(No reference answer provided; evaluate based on question correctness.)\n"
-        prompt += f"User answer: {user_answer}"
-        resp = await self.provider.chat(
-            [{"role": "user", "content": prompt}],
-            model=self.provider.default_model,
-        )
-        return self._parse_json(resp.content or "")
-
-    def parse_questions_locally(self, content: str) -> list[dict] | None:
-        """Parse structured formats (JSON/CSV) without LLM. Returns None if format unrecognized."""
-        content = content.strip()
-        # JSON array of questions
-        if content.startswith("["):
-            try:
-                data = json.loads(content)
-                if isinstance(data, list):
-                    return data
-            except json.JSONDecodeError:
-                pass
-        # JSON object with questions key
-        if content.startswith("{"):
-            try:
-                data = json.loads(content)
-                for key in ("questions", "items", "data", "results"):
-                    if key in data and isinstance(data[key], list):
-                        return data[key]
-            except json.JSONDecodeError:
-                pass
-        # CSV: question|answer|key_points per line
-        lines = content.split("\n")
-        if len(lines) > 1 and ("question" in lines[0].lower() or "|" in content or "\t" in content):
-            sep = "\t" if "\t" in content else ("|" if "|" in content else ",")
-            header = [h.strip().lower() for h in lines[0].split(sep)]
-            q_idx = next((i for i, h in enumerate(header) if h in ("question", "题目", "题")), -1)
-            a_idx = next((i for i, h in enumerate(header) if h in ("answer", "答案", "答")), -1)
-            if q_idx >= 0:
-                result = []
-                for line in lines[1:]:
-                    parts = line.split(sep)
-                    if len(parts) <= q_idx:
-                        continue
-                    result.append({
-                        "question": parts[q_idx].strip() if q_idx < len(parts) else "",
-                        "answer": parts[a_idx].strip() if a_idx >= 0 and a_idx < len(parts) else "",
-                        "key_points": [],
-                    })
-                if result:
-                    return result
-        # Markdown: ## header as question, following text as answer
-        if any(l.strip().startswith("##") for l in lines):
-            # Skip fenced code blocks
-            clean = []; in_code = False
-            for l in lines:
-                if l.strip().startswith("```"): in_code = not in_code; continue
-                if not in_code: clean.append(l)
-            qs = []; cur_q = None; cur_a = []
-            for l in clean:
-                s = l.strip()
-                m = None
-                if s.startswith("### "): m = s[4:]
-                elif s.startswith("## ") and not s.startswith("### "): m = s[3:]
-                if m:
-                    if cur_q: qs.append({"question": cur_q, "answer": "\n".join(cur_a).strip(), "key_points": []})
-                    cur_q = m; cur_a = []
-                elif cur_q:
-                    cur_a.append(l)
-            if cur_q: qs.append({"question": cur_q, "answer": "\n".join(cur_a).strip(), "key_points": []})
-            if len(qs) >= 2:
-                return qs
-        # Bullet list: each line starting with - * or number is a question
-        questions = []
-        for line in lines:
-            stripped = line.strip()
-            if not stripped:
-                continue
-            # Match "- text", "* text", "1. text", "1、text", "1) text"
-            if stripped[0] in ("-", "*", "•") or (
-                stripped[0].isdigit() and len(stripped) > 2 and stripped[1] in (".", "、", ")")
-            ):
-                text = stripped[2:].strip() if stripped[0] in ("-", "*", "•") else stripped[2:].strip()
-                if text:
-                    questions.append({"question": text, "answer": "", "key_points": []})
-        if len(questions) >= 3:
-            return questions
-        return None
-
-    async def parse_questions(self, content: str) -> list[dict]:
-        """Parse file content into structured Q&A pairs. Tries local first, falls back to LLM."""
-        # Try local parsing first
-        local = self.parse_questions_locally(content)
-        if local is not None:
-            return local
-        # Fall back to LLM chunked extraction
-        chars_per_chunk = 3000
-        all_questions: list[dict] = []
-        for i in range(0, len(content), chars_per_chunk):
-            chunk = content[i : i + chars_per_chunk]
-            prompt = (
-                f"{_JSON_PROMPT}\n"
-                "Extract ALL practice questions from the following study material.\n"
-                "Return a JSON array of objects with keys: question, answer, key_points (array of strings).\n"
-                "IMPORTANT: Only extract answers that are explicitly present in the source text. "
-                "If the material does not contain an answer for a question, set answer to empty string.\n"
-                "If none found, return [].\n\n"
-                f"Material (chunk {i // chars_per_chunk + 1}):\n{chunk}"
-            )
-            try:
-                resp = await self.provider.chat(
-                    [{"role": "user", "content": prompt}],
-                    model=self.provider.default_model,
-                )
-                parsed = self._parse_json_list(resp.content or "")
-                if parsed:
-                    all_questions.extend(parsed)
-            except Exception:
-                continue
-        return all_questions
-
-    @staticmethod
-    def _parse_json(text: str) -> dict:
-        text = text.strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[-1]
-            text = text.rsplit("```", 1)[0]
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end > start:
-            text = text[start : end + 1]
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            return {"question": text, "expected_answer": "", "key_points": []}
-
-    @staticmethod
-    def _parse_json_list(text: str) -> list[dict]:
-        text = text.strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[-1]
-            text = text.rsplit("```", 1)[0]
-        start = text.find("[")
-        end = text.rfind("]")
-        if start != -1 and end > start:
-            text = text[start : end + 1]
-        try:
-            data = json.loads(text)
-            return data if isinstance(data, list) else []
-        except json.JSONDecodeError:
-            return []
-
-    async def analyze_content(self, name: str, content: str) -> dict:
-        # Try to parse questions first
-        questions = await self.parse_questions(content)
-        domains: list[str] = []
-        if questions:
-            # Detect domains from first few questions via LLM (cheap)
-            sample = json.dumps(questions[:3], ensure_ascii=False)
-            prompt = (
-                f"{_JSON_PROMPT}\n"
-                "Detect domains/categories for these questions.\n"
-                'Return: {"domains":["domain1","domain2"]}\n\n'
-                f"Questions:\n{sample}"
-            )
-            try:
-                resp = await self.provider.chat(
-                    [{"role": "user", "content": prompt}],
-                    model=self.provider.default_model,
-                )
-                info = self._parse_json(resp.content or "")
-                domains = info.get("domains", [])
-            except Exception:
-                pass
-            if not domains:
-                domains = ["综合"]
-        return {
-            "count": len(questions),
-            "domains": domains,
-            "_questions": questions,
-        }
-
-
-@dataclass
-class ReviewCard:
-    id: str = ""
-    question: str = ""
-    answer: str = ""
-    key_points: str = ""
-    domain: str = ""
-    ease_factor: float = 2.5
-    interval: int = 0
-    repetitions: int = 0
-    next_review: str = ""
-    created_at: str = ""
-
-
-class ReviewManager:
-    """SM-2 spaced repetition review manager."""
-
-    def __init__(self, data_dir: str | Path) -> None:
-        self.path = Path(data_dir) / "review_cards.json"
-        self.cards: list[ReviewCard] = []
-        self._load()
-
-    def _load(self) -> None:
-        if self.path.exists():
-            try:
-                data = json.loads(self.path.read_text("utf-8-sig"))
-                self.cards = [ReviewCard(**c) for c in data]
-            except Exception:
-                self.cards = []
-
-    def _save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps([asdict(c) for c in self.cards], ensure_ascii=False, indent=2),
-            "utf-8",
-        )
-
-    def reload(self) -> None:
-        self._load()
-
-    def get_due(self, limit: int = 20) -> list[ReviewCard]:
-        self.reload()
-        today = date.today().isoformat()
-        return [c for c in self.cards if c.next_review <= today][:limit]
-
-    def rate(self, card_id: str, quality: int) -> ReviewCard | None:
-        card = next((c for c in self.cards if c.id == card_id), None)
-        if not card:
-            return None
-        card.ease_factor = max(
-            1.3,
-            card.ease_factor + (0.1 - (5 - quality) * (0.08 + (5 - quality) * 0.02)),
-        )
-        if quality < 3:
-            card.repetitions = 0
-            card.interval = 1
-        else:
-            if card.repetitions == 0:
-                card.interval = 1
-            elif card.repetitions == 1:
-                card.interval = 6
-            else:
-                card.interval = round(card.interval * card.ease_factor)
-            card.repetitions += 1
-        card.next_review = (date.today() + timedelta(days=card.interval)).isoformat()
-        self._save()
-        return card
-
-    def add_card(
-        self, question: str, answer: str, key_points: str, domain: str = ""
-    ) -> ReviewCard:
-        card = ReviewCard(
-            id=str(uuid.uuid4())[:8],
-            question=question,
-            answer=answer,
-            key_points=key_points,
-            domain=domain,
-            next_review=date.today().isoformat(),
-            created_at=date.today().isoformat(),
-        )
-        self.cards.append(card)
-        self._save()
-        return card
-
-    def stats(self) -> dict:
-        self.reload()
-        today = date.today().isoformat()
-        total = len(self.cards)
-        due = len([c for c in self.cards if c.next_review <= today])
-        return {"total": total, "due": due}
 
 PAGE = r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -1688,6 +1347,7 @@ class WebUIChannel:
         self._stats: dict = {}
         self._practice = PracticeManager(provider, self._banks) if provider else None
         self._review = ReviewManager(self._data_dir)
+        self._memory = MemoryManager(self._data_dir, provider)
         self._plans_file = self._data_dir / "plans.json"
         self._plans: list[dict] = self._load_plans()
         self._server: HTTPServer | None = None
@@ -2001,8 +1661,9 @@ class WebUIChannel:
                     self._ok("application/json", json.dumps({"error": "No provider"}).encode("utf-8"))
                     return
                 try:
+                    mem_ctx = ch._memory.get_context() if hasattr(ch, '_memory') and ch._memory else ""
                     future = asyncio.run_coroutine_threadsafe(
-                        pm.generate_question(bank_names, difficulties), ch._loop
+                        pm.generate_question(bank_names, difficulties, memory_context=mem_ctx), ch._loop
                     )
                     result = future.result(timeout=30)
                     self._ok("application/json", json.dumps(result).encode("utf-8"))
@@ -2018,11 +1679,13 @@ class WebUIChannel:
                     return
                 user_answer = data.get("answer", "")
                 try:
+                    mem_ctx = ch._memory.get_context(domain=pm.current.get("bank_name", "")) if hasattr(ch, '_memory') and ch._memory else ""
                     future = asyncio.run_coroutine_threadsafe(
                         pm.evaluate_answer(
                             pm.current.get("question", ""),
                             pm.current.get("expected_answer", ""),
                             user_answer,
+                            memory_context=mem_ctx,
                         ),
                         ch._loop,
                     )
@@ -2034,6 +1697,20 @@ class WebUIChannel:
                         "timestamp": datetime.now().isoformat(),
                         "bank_name": pm.current.get("bank_name", ""),
                     })
+                    # Fire-and-forget reflection
+                    if hasattr(ch, '_memory') and ch._memory:
+                        asyncio.run_coroutine_threadsafe(
+                            ch._memory.reflect(
+                                question=pm.current.get("question", ""),
+                                expected=pm.current.get("expected_answer", ""),
+                                answer=user_answer,
+                                score=result.get("score", 0),
+                                feedback=result.get("feedback", ""),
+                                missing=result.get("missing_points", []),
+                                domain=pm.current.get("bank_name", ""),
+                            ),
+                            ch._loop,
+                        )
                     self._ok("application/json", json.dumps(result).encode("utf-8"))
                 except Exception as e:
                     self._ok("application/json", json.dumps({"error": str(e)}).encode("utf-8"))
