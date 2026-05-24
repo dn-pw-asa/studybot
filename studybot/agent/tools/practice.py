@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from studybot.agent.tools.base import Tool
+from studybot.practice import PracticeService
 from studybot.providers.base import LLMProvider
 from studybot.storage import Storage
 
@@ -132,12 +133,17 @@ Output a concise system prompt (2-4 paragraphs, in the same language as the ques
 
 
 class PracticeQuestionsTool(Tool):
-    def __init__(self, workspace: str, provider: LLMProvider | None = None) -> None:
+    def __init__(self, workspace: str, provider: LLMProvider | None = None,
+                 storage: Storage | None = None) -> None:
         self._workspace = workspace
         self._provider = provider
         self._practice_dir = Path(workspace) / "practice"
-        self._storage = Storage(Path(workspace) / "studybot.db")
-        self._storage.connect()
+        if storage:
+            self._storage = storage
+        else:
+            self._storage = Storage(Path(workspace) / "studybot.db")
+            self._storage.connect()
+        self._service = PracticeService(self._storage, provider)
         self._auto_migrate()
 
     def _auto_migrate(self) -> None:
@@ -249,12 +255,15 @@ class PracticeQuestionsTool(Tool):
 
     async def execute(self, **kwargs: Any) -> str:
         action = kwargs.get("action", "")
-        if action == "upload_bank":
-            return await self._upload_bank(kwargs)
+        async_handlers = {
+            "upload_bank": self._upload_bank,
+            "submit_answer": self._submit_answer,
+        }
+        if action in async_handlers:
+            return await async_handlers[action](kwargs)
         sync_handlers = {
             "create_plan": lambda: self._create_plan(kwargs),
             "next_question": lambda: self._next_question(kwargs),
-            "submit_answer": lambda: self._submit_answer(kwargs),
             "get_hint": lambda: self._get_hint(kwargs),
             "show_progress": lambda: self._show_progress(kwargs),
             "review_weak_topics": lambda: self._review_weak_topics(kwargs),
@@ -425,7 +434,7 @@ class PracticeQuestionsTool(Tool):
             f"Please answer. Type '提示' for hint, '跳过' to skip."
         )
 
-    def _submit_answer(self, kwargs: dict[str, Any]) -> str:
+    async def _submit_answer(self, kwargs: dict[str, Any]) -> str:
         question_id = kwargs.get("question_id")
         answer = kwargs.get("answer", "")
         is_correct = kwargs.get("is_correct")
@@ -441,14 +450,20 @@ class PracticeQuestionsTool(Tool):
         if is_correct is None:
             std = question.get("answer", "")
             if std:
-                is_correct = self._evaluate_answer(answer, std)
+                if self._provider:
+                    result = await self._service.evaluate_answer(
+                        question.get("content", ""), std, answer,
+                    )
+                    is_correct = result.get("correct", False)
+                else:
+                    is_correct = self._service.simple_evaluate(answer, std)
             else:
                 return f"Answer recorded. No standard answer. Tell me if correct (is_correct=true/false)."
-        record = self._storage.record_answer(bank_name, question_id, is_correct, answer, kps)
-        new_diff = self._storage.adjust_difficulty(bank_name, is_correct)
+        rp = self._service.record_and_progress(bank_name, question, is_correct, answer)
+        record = rp["record"]
+        new_diff = rp["new_difficulty"]
+        dc = rp["daily_completed"]
         progress = self._storage.get_domain_progress(bank_name)
-        dc = progress.get("daily_completed", 0) + 1
-        self._storage.update_domain_progress(bank_name, daily_completed=dc)
 
         if is_correct:
             attempts = record.get("attempt", 1)
@@ -477,16 +492,6 @@ class PracticeQuestionsTool(Tool):
                 f"- '专题提升' for targeted practice on weak points\n"
                 f"- '跳过' to move on"
             )
-
-    @staticmethod
-    def _evaluate_answer(user: str, std: str) -> bool:
-        u, s = user.lower().strip(), std.lower().strip()
-        if u == s or u == s.replace(" ", ""):
-            return True
-        if len(s) > 100:
-            from difflib import SequenceMatcher
-            return SequenceMatcher(None, u, s).ratio() > 0.7
-        return False
 
     def _get_hint(self, kwargs: dict[str, Any]) -> str:
         question_id = kwargs.get("question_id")

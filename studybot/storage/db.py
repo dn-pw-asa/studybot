@@ -120,6 +120,43 @@ CREATE TABLE IF NOT EXISTS sessions (
     updated_at  REAL NOT NULL,
     metadata    TEXT DEFAULT '{}'
 );
+
+CREATE TABLE IF NOT EXISTS file_uploads (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    content     TEXT DEFAULT '',
+    domain_id   TEXT DEFAULT '',
+    created_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS webui_plans (
+    id                  TEXT PRIMARY KEY,
+    name                TEXT NOT NULL,
+    bank_names          TEXT DEFAULT '[]',
+    questions_per_day   INTEGER DEFAULT 10,
+    total_days          INTEGER DEFAULT 30,
+    created             TEXT NOT NULL,
+    logs                TEXT DEFAULT '{}',
+    question_ids        TEXT DEFAULT '[]'
+);
+
+CREATE TABLE IF NOT EXISTS experiences (
+    id              TEXT PRIMARY KEY,
+    category        TEXT NOT NULL,
+    content         TEXT NOT NULL,
+    source_question TEXT DEFAULT '',
+    domain          TEXT DEFAULT '',
+    confidence      REAL DEFAULT 0.5,
+    created_at      TEXT NOT NULL,
+    last_accessed_at TEXT NOT NULL,
+    access_count    INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS user_profiles (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
 """
 
 
@@ -153,7 +190,7 @@ class Storage:
     # ── Connection ──────────────────────────────────────────────
 
     def connect(self) -> None:
-        self._conn = sqlite3.connect(self._db_path)
+        self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
@@ -923,6 +960,217 @@ class Storage:
     def has_json_data(self, practice_dir: str | Path) -> bool:
         banks_dir = Path(practice_dir) / "banks"
         return banks_dir.exists() and any(banks_dir.glob("*.json"))
+
+    # ── Domain deletion ─────────────────────────────────────────
+
+    def delete_domain(self, domain_id: str) -> bool:
+        existing = self._fetchone("SELECT id FROM domains WHERE id = ?", [domain_id])
+        if not existing:
+            return False
+        self._execute("DELETE FROM question_tags WHERE question_id IN (SELECT id FROM questions WHERE domain_id = ?)", [domain_id])
+        self._execute("DELETE FROM answer_records WHERE domain_id = ?", [domain_id])
+        self._execute("DELETE FROM skill_radar WHERE domain_id = ?", [domain_id])
+        self._execute("DELETE FROM review_cards WHERE domain_id = ?", [domain_id])
+        self._execute("DELETE FROM questions WHERE domain_id = ?", [domain_id])
+        self._execute("DELETE FROM domain_progress WHERE domain_id = ?", [domain_id])
+        self._execute("DELETE FROM domains WHERE id = ?", [domain_id])
+        self._execute("DELETE FROM file_uploads WHERE domain_id = ?", [domain_id])
+        return True
+
+    # ── File uploads ────────────────────────────────────────────
+
+    def add_file_upload(self, name: str, content: str = "", domain_id: str = "") -> int:
+        self._execute(
+            "INSERT INTO file_uploads (name, content, domain_id, created_at) VALUES (?, ?, ?, ?)",
+            [name, content, domain_id, _now()],
+        )
+        return self._execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    def get_file_upload(self, upload_id: int) -> dict[str, Any] | None:
+        return self._row2dict(
+            self._fetchone("SELECT * FROM file_uploads WHERE id = ?", [upload_id])
+        )
+
+    def list_file_uploads(self) -> list[dict[str, Any]]:
+        rows = self._fetchall("SELECT * FROM file_uploads ORDER BY id")
+        return [dict(r) for r in rows]
+
+    def delete_file_upload(self, upload_id: int) -> bool:
+        row = self._fetchone("SELECT id FROM file_uploads WHERE id = ?", [upload_id])
+        if not row:
+            return False
+        self._execute("DELETE FROM file_uploads WHERE id = ?", [upload_id])
+        return True
+
+    def list_domain_questions(self, domain_id: str) -> list[dict[str, Any]]:
+        rows = self._fetchall(
+            "SELECT q.*, GROUP_CONCAT(t.tag, '||') as knowledge_points "
+            "FROM questions q LEFT JOIN question_tags t ON t.question_id = q.id "
+            "WHERE q.domain_id = ? GROUP BY q.id ORDER BY q.id",
+            [domain_id],
+        )
+        return [self._question_from_row(r) for r in rows]
+
+    # ── WebUI plans ────────────────────────────────────────────
+
+    def add_webui_plan(self, plan_id: str, name: str, bank_names: list[str],
+                       questions_per_day: int, total_days: int,
+                       logs: dict | None = None,
+                       question_ids: list[str] | None = None) -> dict[str, Any]:
+        plan = {
+            "id": plan_id,
+            "name": name,
+            "bank_names": json.dumps(bank_names, ensure_ascii=False),
+            "questions_per_day": questions_per_day,
+            "total_days": total_days,
+            "created": _today(),
+            "logs": json.dumps(logs or {}, ensure_ascii=False),
+            "question_ids": json.dumps(question_ids or [], ensure_ascii=False),
+        }
+        self._execute(
+            "INSERT INTO webui_plans (id, name, bank_names, questions_per_day, "
+            "total_days, created, logs, question_ids) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            list(plan.values()),
+        )
+        return self.get_webui_plan(plan_id) or plan
+
+    def get_webui_plan(self, plan_id: str) -> dict[str, Any] | None:
+        row = self._fetchone("SELECT * FROM webui_plans WHERE id = ?", [plan_id])
+        if not row:
+            return None
+        d = dict(row)
+        for field in ("bank_names", "logs", "question_ids"):
+            if isinstance(d.get(field), str):
+                try:
+                    d[field] = json.loads(d[field])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        return d
+
+    def list_webui_plans(self) -> list[dict[str, Any]]:
+        rows = self._fetchall("SELECT * FROM webui_plans ORDER BY created DESC")
+        result = []
+        for r in rows:
+            d = dict(r)
+            for field in ("bank_names", "logs", "question_ids"):
+                if isinstance(d.get(field), str):
+                    try:
+                        d[field] = json.loads(d[field])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+            result.append(d)
+        return result
+
+    def update_webui_plan(self, plan_id: str, **kwargs: Any) -> bool:
+        allowed = {"logs", "question_ids"}
+        updates = {}
+        for k, v in kwargs.items():
+            if k in allowed:
+                if isinstance(v, (dict, list)):
+                    updates[k] = json.dumps(v, ensure_ascii=False)
+                else:
+                    updates[k] = v
+        if not updates:
+            return False
+        sets = ", ".join(f"{k} = ?" for k in updates)
+        params: list[Any] = list(updates.values())
+        params.append(plan_id)
+        self._execute(f"UPDATE webui_plans SET {sets} WHERE id = ?", params)
+        return True
+
+    def delete_webui_plan(self, plan_id: str) -> bool:
+        row = self._fetchone("SELECT id FROM webui_plans WHERE id = ?", [plan_id])
+        if not row:
+            return False
+        self._execute("DELETE FROM webui_plans WHERE id = ?", [plan_id])
+        return True
+
+    # ── Experiences / Memory ───────────────────────────────────
+
+    def add_experience(self, exp_id: str, category: str, content: str,
+                       source_question: str = "", domain: str = "",
+                       confidence: float = 0.5) -> None:
+        now = _now()
+        self._execute(
+            "INSERT INTO experiences (id, category, content, source_question, "
+            "domain, confidence, created_at, last_accessed_at, access_count) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
+            [exp_id, category, content, source_question, domain,
+             confidence, now, now],
+        )
+
+    def update_experience(self, exp_id: str, **kwargs: Any) -> None:
+        allowed = {"confidence", "access_count", "last_accessed_at", "content"}
+        updates = {k: v for k, v in kwargs.items() if k in allowed}
+        if not updates:
+            return
+        sets = ", ".join(f"{k} = ?" for k in updates)
+        params: list[Any] = list(updates.values())
+        params.append(exp_id)
+        self._execute(f"UPDATE experiences SET {sets} WHERE id = ?", params)
+
+    def get_experiences(self, domain: str = "", limit: int = 50) -> list[dict[str, Any]]:
+        if domain:
+            rows = self._fetchall(
+                "SELECT * FROM experiences WHERE domain = ? ORDER BY confidence DESC, access_count DESC LIMIT ?",
+                [domain, limit],
+            )
+        else:
+            rows = self._fetchall(
+                "SELECT * FROM experiences ORDER BY confidence DESC, access_count DESC LIMIT ?",
+                [limit],
+            )
+        return [dict(r) for r in rows]
+
+    def find_similar_experience(self, category: str, content: str) -> dict[str, Any] | None:
+        rows = self._fetchall(
+            "SELECT * FROM experiences WHERE category = ?",
+            [category],
+        )
+        for r in rows:
+            existing = dict(r)
+            a_set = set(existing["content"].lower().split())
+            b_set = set(content.lower().split())
+            if a_set and b_set:
+                ratio = len(a_set & b_set) / max(len(a_set), len(b_set))
+                if ratio > 0.45:
+                    return existing
+        return None
+
+    def prune_experiences(self, cutoff_date: str, keep_max: int = 50) -> int:
+        self._execute(
+            "DELETE FROM experiences WHERE confidence < 0.2 AND created_at < ?",
+            [cutoff_date],
+        )
+        count = self._fetchone("SELECT COUNT(*) as cnt FROM experiences")["cnt"]
+        if count > keep_max:
+            rows = self._fetchall(
+                "SELECT id FROM experiences ORDER BY confidence DESC, access_count DESC "
+                "LIMIT ? OFFSET ?",
+                [keep_max, count - keep_max],
+            )
+            ids = [r["id"] for r in rows]
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                self._execute(f"DELETE FROM experiences WHERE id IN ({placeholders})", ids)
+        return count
+
+    def get_user_profile(self, key: str = "default") -> dict[str, Any]:
+        row = self._fetchone(
+            "SELECT value, updated_at FROM user_profiles WHERE key = ?", [key]
+        )
+        if row:
+            try:
+                return json.loads(row["value"])
+            except (json.JSONDecodeError, TypeError):
+                return {}
+        return {}
+
+    def save_user_profile(self, profile: dict[str, Any], key: str = "default") -> None:
+        self._execute(
+            "INSERT OR REPLACE INTO user_profiles (key, value, updated_at) VALUES (?, ?, ?)",
+            [key, json.dumps(profile, ensure_ascii=False), _now()],
+        )
 
 
 def _today_as_date() -> date:

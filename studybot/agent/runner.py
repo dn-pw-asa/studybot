@@ -5,7 +5,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable
 
-from studybot.providers.base import LLMProvider, LLMResponse
+from studybot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from studybot.agent.tools.registry import ToolRegistry
 
 
@@ -111,40 +111,45 @@ class AgentRunner:
         stream_callback: Callable[[str, bool], Any],
     ) -> tuple[list[Any], str | None]:
         """Stream chat response and collect tool calls + full content."""
-        tool_calls = []
+        tool_calls: list[ToolCallRequest] = []
         full_content = ""
-        accumulated_args: dict[str, str] = {}
+        accumulated_calls: dict[int, dict[str, str]] = {}
 
         async for delta in self.provider.chat_stream(
             messages=messages,
             tools=spec.tools.get_definitions(),
             model=spec.model,
         ):
-            # Check if this delta contains tool call data (OpenAI format)
             if isinstance(delta, dict) and "tool_calls" in delta:
                 for tc in delta["tool_calls"]:
                     idx = tc.get("index", 0)
-                    if idx not in accumulated_args:
-                        accumulated_args[idx] = ""
-                    if "function" in tc and "arguments" in tc["function"]:
-                        accumulated_args[idx] += tc["function"]["arguments"]
+                    if idx not in accumulated_calls:
+                        accumulated_calls[idx] = {"id": "", "name": "", "arguments": ""}
+                    entry = accumulated_calls[idx]
+                    if "id" in tc:
+                        entry["id"] = tc["id"]
+                    if "function" in tc:
+                        fn = tc["function"]
+                        if "name" in fn:
+                            entry["name"] = fn["name"]
+                        if "arguments" in fn:
+                            entry["arguments"] += fn["arguments"]
                 continue
 
-            # Text content
             if isinstance(delta, str):
                 full_content += delta
                 await stream_callback(delta, False)
 
-        # Parse accumulated tool call arguments
-        if accumulated_args:
-            # Re-fetch tool call info from a non-streaming call for accuracy
-            response = await self.provider.chat(
-                messages=messages,
-                tools=spec.tools.get_definitions(),
-                model=spec.model,
-            )
-            tool_calls = response.tool_calls
-            full_content = response.content or full_content
+        if accumulated_calls:
+            for idx in sorted(accumulated_calls.keys()):
+                entry = accumulated_calls[idx]
+                try:
+                    args = json.loads(entry["arguments"]) if entry["arguments"] else {}
+                except json.JSONDecodeError:
+                    args = {}
+                tool_calls.append(ToolCallRequest(
+                    id=entry["id"], name=entry["name"], arguments=args,
+                ))
 
         await stream_callback("", True)
         return tool_calls, full_content

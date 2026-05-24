@@ -5,7 +5,7 @@ import asyncio
 import json
 import uuid
 from datetime import datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +13,7 @@ from studybot.bus import InboundMessage, MessageBus, OutboundMessage
 from studybot.channels.practice import PracticeManager
 from studybot.channels.review import ReviewManager
 from studybot.channels.memory import MemoryManager
+from studybot.storage.db import Storage
 
 
 PAGE = r"""<!DOCTYPE html>
@@ -1329,67 +1330,32 @@ class WebUIChannel:
     display_name = "Web UI"
 
     def __init__(
-        self, bus: MessageBus, host: str = "127.0.0.1", port: int = 8769,
+        self, bus: MessageBus, storage: Storage,
+        host: str = "127.0.0.1", port: int = 8769,
         ws_host: str = "127.0.0.1", ws_port: int = 8765,
         provider: Any = None, config_path: str | None = None,
     ) -> None:
         self.bus = bus
+        self.storage = storage
         self.host = host
         self.port = port
         self.ws_host = ws_host
         self.ws_port = ws_port
         self._provider = provider
         self._config_path = Path(config_path) if config_path else None
-        self._data_dir = (self._config_path.parent / "practice_data") if self._config_path else Path.home() / ".studybot" / "practice_data"
-        self._data_dir.mkdir(parents=True, exist_ok=True)
-        self._banks_file = self._data_dir / "banks.json"
-        self._banks: list[dict] = self._load_banks()
         self._stats: dict = {}
-        self._practice = PracticeManager(provider, self._banks) if provider else None
-        self._review = ReviewManager(self._data_dir)
-        self._memory = MemoryManager(self._data_dir, provider)
-        self._plans_file = self._data_dir / "plans.json"
-        self._plans: list[dict] = self._load_plans()
-        self._server: HTTPServer | None = None
+        self._practice = PracticeManager(provider, storage) if provider else None
+        self._review = ReviewManager(storage)
+        self._memory = MemoryManager(storage, provider)
+        self._server: ThreadingHTTPServer | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
-
-    def _load_banks(self) -> list[dict]:
-        if self._banks_file.exists():
-            try:
-                return json.loads(self._banks_file.read_text("utf-8-sig"))
-            except Exception:
-                return []
-        return []
-
-    def _save_banks(self) -> None:
-        try:
-            self._banks_file.write_text(
-                json.dumps(self._banks, ensure_ascii=False, indent=2), "utf-8"
-            )
-        except Exception:
-            pass
-
-    def _load_plans(self) -> list[dict]:
-        if self._plans_file.exists():
-            try:
-                return json.loads(self._plans_file.read_text("utf-8-sig"))
-            except Exception:
-                return []
-        return []
-
-    def _save_plans(self) -> None:
-        try:
-            self._plans_file.write_text(
-                json.dumps(self._plans, ensure_ascii=False, indent=2), "utf-8"
-            )
-        except Exception:
-            pass
+        self._practice_history: list[dict] = []
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
-        self._server = HTTPServer((self.host, self.port), self._make_handler())
+        self._server = ThreadingHTTPServer((self.host, self.port), self._make_handler())
         self._server._channel = self
-        print(f"✓ Web UI channel: http://{self.host}:{self.port}")
+        print(f"✓ Web UI channel (Storage-backed): http://{self.host}:{self.port}")
         await self._loop.run_in_executor(None, self._server.serve_forever)
 
     def _make_handler(self):
@@ -1402,30 +1368,51 @@ class WebUIChannel:
                     self._ok("text/html", body)
                 elif self.path == "/api/banks":
                     ch = self.server._channel
-                    body = json.dumps({"banks": ch._banks}).encode("utf-8")
+                    storage = ch.storage
+                    domains = storage.list_domains()
+                    uploads = storage.list_file_uploads()
+                    upload_map = {}
+                    for u in uploads:
+                        upload_map.setdefault(u["domain_id"], []).append(u)
+                    banks = []
+                    for d in domains:
+                        did = d["id"]
+                        questions = storage.list_domain_questions(did)
+                        files = upload_map.get(did, [])
+                        banks.append({
+                            "name": files[0]["name"] if files else did,
+                            "count": d["question_count"],
+                            "total": d["question_count"],
+                            "domains": [did],
+                            "_questions": [
+                                {
+                                    "question": q["content"],
+                                    "answer": q["answer"],
+                                    "key_points": q.get("knowledge_points", []),
+                                    "difficulty": q["difficulty"],
+                                }
+                                for q in questions
+                            ],
+                        })
+                    body = json.dumps({"banks": banks}).encode("utf-8")
                     self._ok("application/json", body)
                 elif self.path == "/api/stats":
                     ch = self.server._channel
-                    pm = ch._practice
-                    history = pm.history if pm else []
-
-                    practiced_per_bank: dict[str, int] = {}
-                    for h in history:
-                        bn = h.get("bank_name", "")
-                        if bn:
-                            practiced_per_bank[bn] = practiced_per_bank.get(bn, 0) + 1
-
+                    storage = ch.storage
+                    history = ch._practice_history
+                    domains = storage.list_domains()
                     bank_list = []
-                    for b in ch._banks:
-                        name = b.get("name", "未命名")
-                        total = len(b.get("_questions") or [])
-                        practiced = practiced_per_bank.get(name, 0)
-                        bank_list.append({"name": name, "count": practiced, "total": total})
-
+                    for d in domains:
+                        did = d["id"]
+                        summary = storage.get_domain_summary(did)
+                        bank_list.append({
+                            "name": did,
+                            "count": summary["total_answered"],
+                            "total": summary["total_questions"],
+                        })
                     correct = sum(1 for h in history if h.get("evaluation", {}).get("correct"))
                     total = len(history)
                     accuracy = correct / total if total > 0 else 0
-
                     today = date.today()
                     dates = sorted(set(
                         datetime.fromisoformat(h["timestamp"]).date()
@@ -1438,7 +1425,6 @@ class WebUIChannel:
                             streak += 1
                         else:
                             break
-
                     activities = []
                     for h in reversed(history[-20:]):
                         ev = h.get("evaluation", {})
@@ -1449,7 +1435,6 @@ class WebUIChannel:
                             "text": q_text,
                             "time": f"{ev.get('score', 0)}分",
                         })
-
                     body = json.dumps({
                         "total_questions": len(history),
                         "accuracy": accuracy,
@@ -1469,23 +1454,21 @@ class WebUIChannel:
                     self._ok("application/json", body)
                 elif self.path == "/api/practice/question":
                     ch = self.server._channel
-                    self._ok("application/json", json.dumps(ch._practice.current or {}).encode("utf-8"))
+                    pm = ch._practice
+                    self._ok("application/json", json.dumps(pm.current if pm else {}).encode("utf-8"))
                 elif self.path == "/api/review/due":
                     ch = self.server._channel
                     cards = ch._review.get_due()
                     data = json.dumps({
-                        "cards": [
-                            {"id": c.id, "question": c.question,
-                             "answer": c.answer, "key_points": c.key_points,
-                             "domain": c.domain}
-                            for c in cards
-                        ],
+                        "cards": cards,
                         "stats": ch._review.stats(),
                     }).encode("utf-8")
                     self._ok("application/json", data)
                 elif self.path == "/api/plans":
                     ch = self.server._channel
-                    self._ok("application/json", json.dumps({"plans": ch._plans}).encode("utf-8"))
+                    plans_data = ch.storage.list_webui_plans()
+                    body = json.dumps({"plans": plans_data}).encode("utf-8")
+                    self._ok("application/json", body)
                 elif self.path == "/favicon.ico":
                     self._err(204)
                 else:
@@ -1520,16 +1503,14 @@ class WebUIChannel:
                 body = self.rfile.read(length)
                 ctype = self.headers.get("Content-Type", "")
                 ch = self.server._channel
+                storage = ch.storage
 
-                # JSON upload: {name, content}
                 if ctype.startswith("application/json"):
                     try:
                         data = json.loads(body.decode("utf-8"))
                         fname = data.get("name", "unnamed")
                         fcontent = data.get("content", "")
-                        entry = {"name": fname, "count": 0, "domains": [], "content": fcontent}
-                        ch._banks.append(entry)
-                        # Schedule content analysis
+                        upload_id = storage.add_file_upload(fname, fcontent)
                         pm = ch._practice
                         if pm and fcontent:
                             try:
@@ -1537,16 +1518,16 @@ class WebUIChannel:
                                     pm.analyze_content(fname, fcontent), ch._loop
                                 )
                                 info = future.result(timeout=120)
-                                entry.update(info)
+                                for d in info.get("domains", []):
+                                    storage.add_file_upload(fname, fcontent, domain_id=d)
+                                storage.delete_file_upload(upload_id)
                             except Exception:
                                 pass
-                        ch._save_banks()
                     except Exception:
                         pass
                     self._ok("application/json", json.dumps({"ok": True}).encode("utf-8"))
                     return
 
-                # Multipart upload (legacy)
                 if "boundary=" in ctype:
                     boundary = ctype.split("boundary=")[1].split(";")[0].strip('"')
                     parts = body.split(b"--" + boundary.encode())
@@ -1568,19 +1549,20 @@ class WebUIChannel:
                                     fname = urllib.parse.unquote(line.split("utf-8''")[1].split(";")[0])
                         if fname and data:
                             fname = urllib.parse.unquote(fname)
-                            self.server._channel._banks.append({"name": fname, "count": 0, "domains": []})
+                            storage.add_file_upload(fname, data.decode("utf-8", errors="replace"))
                 self._ok("application/json", json.dumps({"ok": True}).encode("utf-8"))
 
             def _handle_bank_delete(self):
                 length = int(self.headers.get("Content-Length", 0))
                 body = self.rfile.read(length)
                 ch = self.server._channel
+                storage = ch.storage
                 try:
                     data = json.loads(body.decode("utf-8"))
                     idx = int(data.get("index", -1))
-                    if 0 <= idx < len(ch._banks):
-                        removed = ch._banks.pop(idx)
-                        ch._save_banks()
+                    domains = storage.list_domains()
+                    if 0 <= idx < len(domains):
+                        storage.delete_domain(domains[idx]["id"])
                         self._ok("application/json", json.dumps({"ok": True}).encode("utf-8"))
                     else:
                         self._ok("application/json", json.dumps({"ok": False, "error": "invalid index"}).encode("utf-8"))
@@ -1600,7 +1582,6 @@ class WebUIChannel:
                 prov = ch._provider
                 apply_restart = []
 
-                # Provider settings — apply immediately
                 if prov and any(k in data for k in ("api_key", "api_base", "model")):
                     prov.update_config(
                         api_key=data.get("api_key"),
@@ -1608,11 +1589,9 @@ class WebUIChannel:
                         model=data.get("model"),
                     )
 
-                # Feishu settings — save to file only (needs restart)
                 if "feishu_app_id" in data or "feishu_app_secret" in data:
                     apply_restart.append("飞书")
 
-                # Persist to config.json
                 cfg_path = ch._config_path
                 if cfg_path:
                     try:
@@ -1661,7 +1640,7 @@ class WebUIChannel:
                     self._ok("application/json", json.dumps({"error": "No provider"}).encode("utf-8"))
                     return
                 try:
-                    mem_ctx = ch._memory.get_context() if hasattr(ch, '_memory') and ch._memory else ""
+                    mem_ctx = ch._memory.get_context() if ch._memory else ""
                     future = asyncio.run_coroutine_threadsafe(
                         pm.generate_question(bank_names, difficulties, memory_context=mem_ctx), ch._loop
                     )
@@ -1679,7 +1658,7 @@ class WebUIChannel:
                     return
                 user_answer = data.get("answer", "")
                 try:
-                    mem_ctx = ch._memory.get_context(domain=pm.current.get("bank_name", "")) if hasattr(ch, '_memory') and ch._memory else ""
+                    mem_ctx = ch._memory.get_context(domain=pm.current.get("bank_name", "")) if ch._memory else ""
                     future = asyncio.run_coroutine_threadsafe(
                         pm.evaluate_answer(
                             pm.current.get("question", ""),
@@ -1690,15 +1669,23 @@ class WebUIChannel:
                         ch._loop,
                     )
                     result = future.result(timeout=30)
-                    pm.history.append({
+                    rec = {
                         "question": pm.current.get("question", ""),
                         "answer": user_answer,
                         "evaluation": result,
                         "timestamp": datetime.now().isoformat(),
                         "bank_name": pm.current.get("bank_name", ""),
-                    })
-                    # Fire-and-forget reflection
-                    if hasattr(ch, '_memory') and ch._memory:
+                    }
+                    ch._practice_history.append(rec)
+                    # Persist answer to shared Storage with progress tracking
+                    domain_id = pm.current.get("bank_name", "")
+                    if domain_id:
+                        pm.service.record_and_progress(
+                            domain_id, pm.current,
+                            is_correct=result.get("correct", False),
+                            answer_text=user_answer,
+                        )
+                    if ch._memory:
                         asyncio.run_coroutine_threadsafe(
                             ch._memory.reflect(
                                 question=pm.current.get("question", ""),
@@ -1734,60 +1721,56 @@ class WebUIChannel:
                     domain=data.get("domain", ""),
                 )
                 stats = ch._review.stats()
-                self._ok("application/json", json.dumps({"ok": True, "id": card.id, "stats": stats}).encode("utf-8"))
+                self._ok("application/json", json.dumps({"ok": True, "id": card.get("id", ""), "stats": stats}).encode("utf-8"))
 
             def _handle_plan_create(self):
                 data = self._read_body()
                 ch = self.server._channel
+                storage = ch.storage
                 bank_names = data.get("bank_names", [])
                 qpd = int(data.get("questions_per_day", 10))
                 total_days = int(data.get("total_days", 30))
-                # Collect and shuffle all questions from selected banks
                 all_qs: list[dict] = []
-                for b in ch._banks:
-                    name = b.get("name", "")
-                    if bank_names and name not in bank_names:
+                domains = storage.list_domains()
+                for d in domains:
+                    did = d["id"]
+                    if bank_names and did not in bank_names:
                         continue
-                    for q in (b.get("_questions") or b.get("questions", [])):
+                    questions = storage.list_domain_questions(did)
+                    for q in questions:
                         all_qs.append({
-                            "question": q.get("question", q.get("content", "")),
-                            "expected_answer": q.get("answer", q.get("expected_answer", "")),
-                            "key_points": q.get("key_points", q.get("knowledge_points", [])),
-                            "bank_name": name,
+                            "question": q["content"],
+                            "expected_answer": q.get("answer", ""),
+                            "key_points": q.get("knowledge_points", []),
+                            "bank_name": did,
                         })
+                import random
                 random.shuffle(all_qs)
-                # Assign questions to days (flat array, frontend slices by day)
                 total_needed = qpd * total_days
                 assigned = all_qs[:total_needed]
-                plan = {
-                    "id": uuid.uuid4().hex[:12],
-                    "name": data.get("name", "未命名计划"),
-                    "bank_names": bank_names,
-                    "questions_per_day": qpd,
-                    "total_days": total_days,
-                    "created": date.today().isoformat(),
-                    "logs": {},
-                    "questions": assigned,
-                }
-                ch._plans.append(plan)
-                ch._save_plans()
+                plan_id = uuid.uuid4().hex[:12]
+                plan = storage.add_webui_plan(
+                    plan_id=plan_id,
+                    name=data.get("name", "未命名计划"),
+                    bank_names=bank_names,
+                    questions_per_day=qpd,
+                    total_days=total_days,
+                )
+                plan["questions"] = assigned
+                q_ids = [uuid.uuid4().hex[:8] for _ in assigned]
+                storage.update_webui_plan(plan_id, question_ids=q_ids)
                 self._ok("application/json", json.dumps({"ok": True, "plan": plan}).encode("utf-8"))
 
             def _handle_plan_delete(self):
                 data = self._read_body()
                 ch = self.server._channel
-                ch._plans = [p for p in ch._plans if p.get("id") != data.get("id")]
-                ch._save_plans()
+                ch.storage.delete_webui_plan(data.get("id", ""))
                 self._ok("application/json", json.dumps({"ok": True}).encode("utf-8"))
 
             def _handle_plan_progress(self):
                 data = self._read_body()
                 ch = self.server._channel
-                for p in ch._plans:
-                    if p.get("id") == data.get("id"):
-                        p["logs"] = data.get("logs", {})
-                        break
-                ch._save_plans()
+                ch.storage.update_webui_plan(data.get("id", ""), logs=data.get("logs", {}))
                 self._ok("application/json", json.dumps({"ok": True}).encode("utf-8"))
 
             def _ok(self, content_type, body):

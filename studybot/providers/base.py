@@ -66,7 +66,7 @@ class LLMProvider(ABC):
         model: str | None = None,
         max_tokens: int | None = None,
         temperature: float | None = None,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[str | dict]:
         """Stream text content token by token. Override in subclass."""
         resp = await self.chat(
             messages=messages, tools=tools, model=model,
@@ -99,7 +99,6 @@ class LLMProvider(ABC):
                 if msg["role"] == "user":
                     fixed.append({"role": "assistant", "content": "..."})
                 else:
-                    fixed.append({"role": "user", "content": msg.get("content", "")})
-                    continue
+                    fixed.append({"role": "user", "content": "..."})
             fixed.append(msg)
         return fixed

@@ -47,7 +47,7 @@ class OpenAICompatProvider(LLMProvider):
         model: str | None = None,
         max_tokens: int | None = None,
         temperature: float | None = None,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[str | dict]:
         kwargs: dict[str, Any] = {
             "model": model or self.default_model,
             "messages": messages,
@@ -61,8 +61,21 @@ class OpenAICompatProvider(LLMProvider):
 
         stream = await self._client.chat.completions.create(**kwargs)
         async for chunk in stream:
-            if chunk.choices and chunk.choices[0].delta.content:
-                yield chunk.choices[0].delta.content
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            if delta.tool_calls:
+                for tc in delta.tool_calls:
+                    yield {"tool_calls": [{
+                        "index": tc.index,
+                        "id": tc.id if hasattr(tc, "id") and tc.id else None,
+                        "function": {
+                            "name": tc.function.name if hasattr(tc, "function") and tc.function and hasattr(tc.function, "name") and tc.function.name else None,
+                            "arguments": tc.function.arguments if hasattr(tc, "function") and tc.function and tc.function.arguments else "",
+                        },
+                    }]}
+            if delta.content:
+                yield delta.content
 
     def _parse_response(self, resp: Any) -> LLMResponse:
         choice = resp.choices[0]

@@ -14,6 +14,7 @@ from studybot.channels.websocket import WebSocketChannel
 from studybot.config import Config
 from studybot.providers.openai_compat import OpenAICompatProvider
 from studybot.session import SessionManager
+from studybot.storage.db import Storage
 
 
 def load_config(config_path: str | None = None) -> Config:
@@ -28,7 +29,7 @@ def load_config(config_path: str | None = None) -> Config:
     return Config()
 
 
-def _build_channels(config, bus, provider=None, config_path=None):
+def _build_channels(config, bus, storage, provider=None, config_path=None):
     if config_path is None:
         config_path = str(Path.home() / ".studybot" / "config.json")
     channels: dict[str, object] = {}
@@ -67,12 +68,13 @@ def _build_channels(config, bus, provider=None, config_path=None):
     if config.webui.enabled:
         from studybot.channels.webui import WebUIChannel
         webui = WebUIChannel(
-            bus=bus, host=config.webui.host, port=config.webui.port,
+            bus=bus, storage=storage,
+            host=config.webui.host, port=config.webui.port,
             ws_host=config.gateway.host, ws_port=config.gateway.port,
             provider=provider, config_path=config_path,
         )
         channels["webui"] = webui
-        print(f"✓ Web UI channel: http://{config.webui.host}:{config.webui.port}")
+        print(f"✓ Web UI channel (Storage-backed): http://{config.webui.host}:{config.webui.port}")
 
     return channels
 
@@ -91,8 +93,13 @@ async def run_gateway(config_path: str | None = None) -> None:
         default_model=config.provider.model,
     )
     session_manager = SessionManager(workspace)
+
+    # Shared Storage instance — single source of truth
+    storage = Storage(workspace / "studybot.db")
+    storage.connect()
+
     tools = ToolRegistry()
-    tools.register(PracticeQuestionsTool(workspace=str(workspace), provider=provider))
+    tools.register(PracticeQuestionsTool(workspace=str(workspace), provider=provider, storage=storage))
 
     agent = PracticeAgentLoop(
         provider=provider, tools=tools, session_manager=session_manager,
@@ -100,7 +107,7 @@ async def run_gateway(config_path: str | None = None) -> None:
         max_iterations=config.max_iterations,
     )
 
-    channels = _build_channels(config, bus, provider=provider, config_path=config_path)
+    channels = _build_channels(config, bus, storage, provider=provider, config_path=config_path)
 
     async def outbound_consumer() -> None:
         while True:
@@ -115,7 +122,7 @@ async def run_gateway(config_path: str | None = None) -> None:
             else:
                 await ch.send(msg)
 
-    async def health_server() -> None:
+    def health_server() -> None:
         import http.server
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -132,8 +139,8 @@ async def run_gateway(config_path: str | None = None) -> None:
             def log_message(self, format, *args):
                 pass
 
-        server = http.server.HTTPServer((config.gateway.host, config.gateway.port + 1), Handler)
-        print(f"✓ Health endpoint: http://{config.gateway.host}:{config.gateway.port + 1}/health")
+        server = http.server.HTTPServer((config.gateway.host, config.gateway.port + 1000), Handler)
+        print(f"✓ Health endpoint: http://{config.gateway.host}:{config.gateway.port + 1000}/health")
         server.serve_forever()
 
     print(f"✓ Registered tools: {list(tools._tools.keys())}")
@@ -145,7 +152,7 @@ async def run_gateway(config_path: str | None = None) -> None:
     coros = [agent.run(), outbound_consumer()]
     for ch in channels.values():
         coros.append(ch.start())
-    coros.append(asyncio.to_thread(lambda: asyncio.run(health_server())))
+    coros.append(asyncio.to_thread(health_server))
 
     await asyncio.gather(*coros)
 

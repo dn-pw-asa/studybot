@@ -146,11 +146,17 @@ class OneBotChannel:
 
         target = msg.chat_id
         if target.startswith("qq:g:"):
+            suffix = target[5:]
+            if not suffix.isdigit():
+                return
             action = "send_group_msg"
-            params = {"group_id": int(target[5:]), "message": msg.content}
+            params = {"group_id": int(suffix), "message": msg.content}
         elif target.startswith("qq:u:"):
+            suffix = target[5:]
+            if not suffix.isdigit():
+                return
             action = "send_private_msg"
-            params = {"user_id": int(target[5:]), "message": msg.content}
+            params = {"user_id": int(suffix), "message": msg.content}
         else:
             return
 

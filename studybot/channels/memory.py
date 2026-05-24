@@ -3,27 +3,14 @@ from __future__ import annotations
 
 import json
 import uuid
-from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Any
 
-
-@dataclass
-class Experience:
-    id: str
-    category: str
-    content: str
-    source_question: str = ""
-    domain: str = ""
-    confidence: float = 0.5
-    created_at: str = ""
-    last_accessed_at: str = ""
-    access_count: int = 0
+from studybot.storage.db import Storage
 
 
 class MemoryManager:
-    """Self-evolving memory: reflection, user profiling, cross-session reuse, consolidation."""
+    """Self-evolving memory backed by shared Storage."""
 
     _REFLECT_PROMPT = """You are a learning analysis system. Based on the following question, user's answer, and your evaluation, extract insights.
 
@@ -44,10 +31,9 @@ Return JSON only:
   "error_pattern": "a recurring mistake pattern if any, or empty string"
 }}"""
 
-    def __init__(self, data_dir: str | Path, provider: Any = None) -> None:
-        self.path = Path(data_dir) / "memory.json"
+    def __init__(self, storage: Storage, provider: Any = None) -> None:
+        self.storage = storage
         self.provider = provider
-        self.experiences: list[Experience] = []
         self.profile: dict = {
             "weak_areas": [], "strong_areas": [],
             "error_patterns": [], "estimated_level": "beginner",
@@ -58,22 +44,13 @@ Return JSON only:
         self._load()
 
     def _load(self) -> None:
-        if not self.path.exists():
-            return
-        try:
-            data = json.loads(self.path.read_text("utf-8-sig"))
-            self.experiences = [Experience(**e) for e in data.get("experiences", [])]
-            self.profile = data.get("profile", self.profile)
-            self._add_count = len(self.experiences)
-        except Exception:
-            pass
+        saved = self.storage.get_user_profile()
+        if saved:
+            self.profile = saved
+        self._add_count = len(self.storage.get_experiences())
 
-    def _save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps({
-            "experiences": [asdict(e) for e in self.experiences],
-            "profile": self.profile,
-        }, ensure_ascii=False, indent=2), "utf-8")
+    def _save_profile(self) -> None:
+        self.storage.save_user_profile(self.profile)
 
     async def reflect(self, question: str, expected: str, answer: str,
                       score: int, feedback: str, missing: list[str],
@@ -92,36 +69,38 @@ Return JSON only:
                 model=self.provider.default_model,
                 temperature=0.3,
             )
-            result = json.loads((resp.content or "").strip().removeprefix("```json").removeprefix("```").removesuffix("```"))
+            text = (resp.content or "").strip()
+            text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            result = json.loads(text)
         except Exception:
             return
 
-        exp = Experience(
-            id=uuid.uuid4().hex[:12],
-            category=result.get("category", "knowledge_gap"),
-            content=result.get("experience", "").strip(),
-            source_question=question[:120],
-            domain=domain,
-            created_at=datetime.now().isoformat(),
-            last_accessed_at=datetime.now().isoformat(),
-        )
-        if not exp.content:
+        content = result.get("experience", "").strip()
+        if not content:
             return
-        self._add_experience(exp)
-        self._update_profile(result, score)
-        self._save()
+        exp_id = uuid.uuid4().hex[:12]
+        category = result.get("category", "knowledge_gap")
+        # Merge with similar existing
+        similar = self.storage.find_similar_experience(category, content)
+        if similar:
+            self.storage.update_experience(
+                similar["id"],
+                confidence=min(1.0, similar["confidence"] + 0.15),
+                access_count=similar["access_count"] + 1,
+                last_accessed_at=datetime.now().isoformat(),
+            )
+        else:
+            self.storage.add_experience(
+                exp_id=exp_id, category=category, content=content,
+                source_question=question[:120], domain=domain,
+            )
+            self._add_count += 1
+            if self._add_count % 10 == 0:
+                cutoff = (datetime.now() - timedelta(days=60)).isoformat()
+                self.storage.prune_experiences(cutoff)
 
-    def _add_experience(self, exp: Experience) -> None:
-        for existing in self.experiences:
-            if existing.category == exp.category and self._content_similar(existing.content, exp.content):
-                existing.confidence = min(1.0, existing.confidence + 0.15)
-                existing.access_count += 1
-                existing.last_accessed_at = datetime.now().isoformat()
-                return
-        self.experiences.append(exp)
-        self._add_count += 1
-        if self._add_count % 10 == 0:
-            self._prune_and_merge()
+        self._update_profile(result, score)
+        self._save_profile()
 
     @staticmethod
     def _content_similar(a: str, b: str) -> bool:
@@ -161,11 +140,10 @@ Return JSON only:
         self.profile["last_updated"] = datetime.now().isoformat()
 
     def get_context(self, domain: str = "", limit: int = 4) -> str:
+        exps = self.storage.get_experiences(domain=domain, limit=50)
         scored = []
-        for e in self.experiences:
-            if domain and e.domain and e.domain != domain:
-                continue
-            score = e.confidence * (1.0 + 0.2 * e.access_count)
+        for e in exps:
+            score = e["confidence"] * (1.0 + 0.2 * e["access_count"])
             scored.append((score, e))
         scored.sort(key=lambda x: -x[0])
         top = scored[:limit]
@@ -174,7 +152,7 @@ Return JSON only:
         if top:
             parts.append("## 过往经验")
             for _, e in top:
-                parts.append(f"- [{e.category}] {e.content}")
+                parts.append(f"- [{e['category']}] {e['content']}")
         profile = self.profile
         if profile.get("weak_areas"):
             parts.append(f"\n## 用户画像\n薄弱领域: {', '.join(profile['weak_areas'][:5])}")
@@ -185,23 +163,3 @@ Return JSON only:
         parts.append(f"预估水平: {profile.get('estimated_level', 'beginner')}")
         parts.append(f"总练习: {profile.get('total_practiced', 0)}次, 平均分: {profile.get('avg_score', 0):.0f}")
         return "\n".join(parts)
-
-    def _prune_and_merge(self) -> None:
-        cutoff = (datetime.now() - timedelta(days=60)).isoformat()
-        self.experiences = [
-            e for e in self.experiences
-            if not (e.confidence < 0.2 and e.created_at < cutoff)
-        ]
-        merged: list[Experience] = []
-        for e in sorted(self.experiences, key=lambda x: -x.confidence):
-            found = False
-            for m in merged:
-                if m.category == e.category and self._content_similar(m.content, e.content):
-                    m.confidence = max(m.confidence, e.confidence)
-                    m.access_count += e.access_count
-                    m.last_accessed_at = max(m.last_accessed_at, e.last_accessed_at)
-                    found = True
-                    break
-            if not found:
-                merged.append(e)
-        self.experiences = merged[:50]

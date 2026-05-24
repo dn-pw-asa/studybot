@@ -97,18 +97,12 @@ class PracticeAgentLoop:
         async def stream_callback(text: str, done: bool) -> None:
             if text:
                 streamed_content.append(text)
-                # Push stream delta to channel
-                from studybot.channels.websocket import WebSocketChannel
-                ws_channel = None
-                for handler in [self.bus]:
-                    pass
-                # Stream via outbound with special marker
-                await self.bus.publish_outbound(OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                    content=text,
-                    metadata={"stream": True, "done": done},
-                ))
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=text,
+                metadata={"stream": True, "done": done},
+            ))
 
         result = await self.runner.run_stream(spec, stream_callback)
 
